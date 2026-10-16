@@ -1,5 +1,4 @@
-import { createReadStream } from "node:fs";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -11,15 +10,14 @@ const dataDirectory = path.join(root, "data");
 const filesDirectory = path.join(dataDirectory, "files");
 const itemsFile = path.join(dataDirectory, "items.json");
 const items = [];
+const files = new Map();
 const changeSubscribers = new Set();
 
-await mkdir(filesDirectory, { recursive: true });
-try {
-  const savedItems = JSON.parse(await readFile(itemsFile, "utf8"));
-  if (Array.isArray(savedItems)) items.push(...savedItems);
-} catch (error) {
-  if (error.code !== "ENOENT") console.error("读取共享内容失败:", error);
-}
+// Remove data written by older versions; shared content now exists only in memory.
+await Promise.all([
+  rm(itemsFile, { force: true }),
+  rm(filesDirectory, { recursive: true, force: true }),
+]);
 
 function json(response, status, body) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -41,19 +39,8 @@ function subscribeToChanges(request, response) {
   request.on("close", () => changeSubscribers.delete(response));
 }
 
-async function saveItems() {
-  const temporaryFile = `${itemsFile}.tmp`;
-  await writeFile(temporaryFile, JSON.stringify(items, null, 2), "utf8");
-  await rename(temporaryFile, itemsFile);
-}
-
-async function removeFile(item) {
-  if (item.kind === "text") return;
-  try {
-    await unlink(path.join(filesDirectory, item.id));
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
+function removeFile(item) {
+  if (item.kind !== "text") files.delete(item.id);
 }
 
 async function bodyOf(request) {
@@ -81,22 +68,17 @@ function accessAddresses(port) {
     .map(({ interfaceName, entry }) => ({ interface: interfaceName, address: entry.address, url: `http://${entry.address}:${port}` }));
 }
 
-async function serveFile(response, item, headOnly = false) {
-  const filePath = path.join(filesDirectory, item.id);
-  try {
-    const fileStats = await stat(filePath);
-    response.writeHead(200, {
-      "Content-Type": item.mime || "application/octet-stream",
-      "Content-Length": fileStats.size,
-      "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(item.name || "shared-file")}`,
-      "Cache-Control": "no-cache",
-    });
-    if (!headOnly) createReadStream(filePath).pipe(response);
-    else response.end();
-  } catch (error) {
-    if (error.code === "ENOENT") json(response, 404, { error: "文件不存在" });
-    else json(response, 500, { error: "读取文件失败" });
-  }
+function serveFile(response, item, headOnly = false) {
+  const buffer = files.get(item.id);
+  if (!buffer) return json(response, 404, { error: "文件不存在" });
+  response.writeHead(200, {
+    "Content-Type": item.mime || "application/octet-stream",
+    "Content-Length": buffer.length,
+    "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(item.name || "shared-file")}`,
+    "Cache-Control": "no-cache",
+  });
+  if (headOnly) response.end();
+  else response.end(buffer);
 }
 
 async function handleApi(request, response, url) {
@@ -125,13 +107,12 @@ async function handleApi(request, response, url) {
       if (body.kind !== "text") {
         const decoded = decodeData(body.data);
         item.mime = item.mime || decoded.mime;
-        await writeFile(path.join(filesDirectory, id), decoded.buffer);
+        files.set(id, decoded.buffer);
         item.url = `/api/files/${id}`;
       }
       items.unshift(item);
       const removedItems = items.splice(80);
-      await Promise.all(removedItems.map(removeFile));
-      await saveItems();
+      removedItems.forEach(removeFile);
       publishChange();
       return json(response, 201, item);
     }).catch(() => json(response, 400, { error: "无法保存内容" }));
@@ -140,8 +121,7 @@ async function handleApi(request, response, url) {
   if (url.pathname === "/api/items" && request.method === "DELETE") {
     if (!url.searchParams.has("id")) {
       const removedItems = items.splice(0);
-      await Promise.all(removedItems.map(removeFile));
-      await saveItems();
+      removedItems.forEach(removeFile);
       publishChange();
       return json(response, 200, { ok: true });
     }
@@ -149,8 +129,7 @@ async function handleApi(request, response, url) {
     const index = items.findIndex((item) => item.id === url.searchParams.get("id"));
     if (index >= 0) {
       const [removedItem] = items.splice(index, 1);
-      await removeFile(removedItem);
-      await saveItems();
+      removeFile(removedItem);
       publishChange();
     }
     return json(response, 200, { ok: true });
@@ -177,3 +156,19 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`局域网投递板已启动: http://localhost:${port}`);
   console.log("同一 Wi-Fi 下的设备请访问这台机器的局域网 IP + 端口");
 });
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const response of changeSubscribers) response.end();
+  changeSubscribers.clear();
+
+  await new Promise((resolve) => server.close(resolve));
+  items.splice(0);
+  files.clear();
+  console.log("服务已退出，内存中的历史记录已清除");
+}
+
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);
